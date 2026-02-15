@@ -1,0 +1,6 @@
+line-bot-sdk
+flask
+selenium
+webdriver-manager
+beautifulsoup4
+python-dotenv
