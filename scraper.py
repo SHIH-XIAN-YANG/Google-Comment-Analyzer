@@ -1,134 +1,103 @@
-import time
+import os
 import requests
 import urllib.parse
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# 載入 .env 裡的金鑰
+load_dotenv()
+OUTSCRAPER_API_KEY = os.getenv('OUTSCRAPER_API_KEY')
 
 def expand_url(short_url):
-    """還原短網址"""
+    """
+    將短網址還原，如果是 Google 搜尋連結，則提取出精準的店名關鍵字
+    """
+    print(f"🔄 正在解析網址: {short_url}")
     try:
-        # 偽裝成瀏覽器，避免 Google 直接拒絕連線
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
         }
+        # 取得跳轉後的真實網址
         response = requests.get(short_url, headers=headers, allow_redirects=True)
-        return response.url
+        real_url = response.url
+        print(f"🔗 真實網址為: {real_url}")
+        
+        # 如果是 Google 搜尋結果，把搜尋關鍵字 (q=...) 抽出來當作 Query
+        if "/search?" in real_url:
+            parsed_url = urllib.parse.urlparse(real_url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            if 'q' in query_params:
+                # 提取關鍵字並加上 "台灣" 增加準確度
+                search_term = query_params['q'][0] + " 台灣"
+                print(f"🎯 轉換為精準搜尋關鍵字: {search_term}")
+                return search_term
+                
+        return real_url
     except Exception as e:
-        print(f"URL 解析錯誤: {e}")
+        print(f"⚠️ 網址解析錯誤: {e}")
         return short_url
 
-def scrape_google_reviews(url, max_reviews=10):
-    print(f"正在處理連結: {url}")
+def scrape_google_reviews(query, max_reviews=50):
+    print(f"🚀 正在發送請求至 Outscraper API: {query}")
     
-    chrome_options = Options()
-    # chrome_options.add_argument("--headless") # 測試時建議先不開 headless
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--lang=zh-TW") # 強制中文介面
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
+    if not OUTSCRAPER_API_KEY:
+        print("❌ 找不到 OUTSCRAPER_API_KEY")
+        return []
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    api_url = "https://api.app.outscraper.com/maps/reviews-v3"
+    
+    params = {
+        "query": query,  
+        "reviewsLimit": max_reviews, 
+        "language": "zh-TW",      
+        "sort": "newest",         
+        "ignoreEmpty": "false",
+        "async": "false" # 強制同步回傳
+    }
+    
+    headers = {
+        "X-API-KEY": OUTSCRAPER_API_KEY
+    }
     
     try:
-        driver.get(url)
-        time.sleep(3) # 等待初次載入
-
-        # --- 關鍵修正：檢測是否誤入 Google Search 頁面 ---
-        current_url = driver.current_url
-        if "/search?" in current_url:
-            print("偵測到這是 Google 搜尋頁面，正在嘗試切換至 Google 地圖模式...")
-            
-            # 方法 1: 從網址中提取搜尋關鍵字，重新組合成 Maps 連結
-            # 搜尋網址通常長這樣: ...google.com/search?q=Seed+Bakery...
-            parsed_url = urllib.parse.urlparse(current_url)
-            query_params = urllib.parse.parse_qs(parsed_url.query)
-            
-            if 'q' in query_params:
-                search_query = query_params['q'][0]
-                # 重新導向到 Google Maps 搜尋介面
-                new_map_url = f"https://www.google.com/maps/search/{search_query}"
-                print(f"重新導向至: {new_map_url}")
-                driver.get(new_map_url)
-                time.sleep(5) # 等待地圖載入
-            else:
-                print("無法提取關鍵字，嘗試直接尋找地圖按鈕...")
-        # -----------------------------------------------
-
-        # 嘗試尋找滾動容器
-        # 策略更新：嘗試多種常見的 Selector
-        scrollable_div = None
-        selectors = [
-            'div[role="feed"]',  # 最常見的
-            'div.m6QErb.DxyBCb.kA9KIf.dS8AEf', # 另一種常見結構
-            'div.e07Vkf.kA9KIf'
-        ]
+        response = requests.get(api_url, params=params, headers=headers)
+        response.raise_for_status() 
+        data = response.json()
         
-        for selector in selectors:
-            try:
-                scrollable_div = driver.find_element(By.CSS_SELECTOR, selector)
-                if scrollable_div:
-                    print(f"成功定位滾動區塊: {selector}")
-                    break
-            except:
-                continue
-
-        if scrollable_div:
-            print("開始滾動載入評論...")
-            for _ in range(0, max_reviews, 5): 
-                driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
-                time.sleep(2) 
-        else:
-            print("⚠️ 警告：找不到滾動區塊，將只抓取目前畫面可見的評論。")
-
-        # 解析 HTML
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        
-        # 抓取評論卡片 (這裡也要多種策略，因為 Google Class 常變)
-        review_blocks = soup.find_all("div", class_="jftiEf")
-        if not review_blocks:
-             # 如果 jftiEf 找不到，嘗試找比較通用的結構
-             review_blocks = soup.select('div[data-review-id]')
-
-        print(f"找到 {len(review_blocks)} 個評論區塊")
-
-        cleaned_data = []
-        for block in review_blocks:
-            try:
-                # 嘗試抓取作者
-                author = block.find("div", class_="d4r55")
-                if not author: author = block.get("aria-label") # 有時候作者名在屬性裡
-                author_text = author.text.strip() if author else "未知用戶"
+        if "data" in data and len(data["data"]) > 0:
+            shop_data = data["data"][0] 
+            
+            # 檢查是否真的有找到地點
+            if shop_data.get("place_id") == "__NO_PLACE_FOUND__":
+                print("❌ Outscraper 找不到該地點，請確認網址或店名是否正確。")
+                return []
                 
-                # 嘗試抓取內容
-                content_elem = block.find("span", class_="wiI7pd")
-                content = content_elem.text.strip() if content_elem else "(無文字評論)"
-                
-                # 嘗試抓取星等
-                stars_elem = block.find("span", class_="kvMYJc")
-                rating = "0"
-                if stars_elem:
-                    aria = stars_elem.get("aria-label") # 例如 "5 顆星"
-                    if aria:
-                        import re
-                        match = re.search(r'\d+', aria)
-                        if match: rating = match.group()
-
+            raw_reviews = shop_data.get("reviews_data", [])
+            print(f"✅ 成功抓取到 {len(raw_reviews)} 則評論！")
+            
+            cleaned_data = []
+            for rev in raw_reviews:
                 cleaned_data.append({
-                    "author": author_text,
-                    "rating": rating,
-                    "content": content
+                    "author": rev.get("author_title", "未知用戶"),
+                    "rating": rev.get("review_rating", 0),
+                    "date": rev.get("review_datetime_utc", ""), 
+                    "content": rev.get("review_text", "(無文字)"),
                 })
-            except Exception as loop_e:
-                print(f"解析單一評論失敗: {loop_e}")
-                continue
-                
-        return cleaned_data
+            return cleaned_data
+        else:
+            return []
 
     except Exception as e:
-        print(f"爬蟲發生錯誤: {e}")
+        print(f"❌ API 請求失敗: {e}")
         return []
-    finally:
-        driver.quit()
+
+# --- 單獨測試區塊 ---
+if __name__ == "__main__":
+    # 測試 1: 給它一個絕對不會錯的 Google Maps 完整長網址 (台北101)
+    test_query = "https://www.google.com/maps/place/%E5%8F%B0%E5%8C%97101%E8%A7%80%E6%99%AF%E5%8F%B0/@25.0336793,121.5621494,17z/data=!3m1!4b1!4m6!3m5!1s0x3442abb6da80a7ad:0xacc4d11dc963103c!8m2!3d25.0336745!4d121.5647243!16s%2Fg%2F11b6_c2v6_?entry=ttu"
+    
+    # 我們先過水一下 expand_url 函數
+    final_query = expand_url(test_query)
+    
+    reviews = scrape_google_reviews(final_query, max_reviews=5)
+    import json
+    print(json.dumps(reviews, ensure_ascii=False, indent=2))
